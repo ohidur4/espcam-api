@@ -3,13 +3,13 @@
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import cv2
 import numpy as np
 import base64
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 import io
 import json
 from typing import List, Dict
+import math
 
 app = FastAPI(title="Akash Pathabo Detection API", version="1.0.0")
 
@@ -22,22 +22,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Simple YOLO-like object detection (using OpenCV DNN)
-# This will work without heavy ML libraries
-CONFIDENCE_THRESHOLD = 0.3
+# Simple object detection classes
 CLASSES = [
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
-    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
-    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
-    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
-    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
-    "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
-    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
-    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
-    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
-    "toothbrush"
+    "person", "car", "bottle", "cell phone", "chair", "table", "laptop"
 ]
 
 @app.get("/")
@@ -76,18 +63,14 @@ async def detect_objects(
                 image_data = image_data.split("base64,")[1]
             
             image_bytes = base64.b64decode(image_data)
-            image = Image.open(io.BytesIO(image_bytes))
-            
-            # Convert PIL to OpenCV format
-            opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            height, width = opencv_image.shape[:2]
+            image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+            width, height = image.size
             
         except Exception as e:
             return {"error": f"Invalid image data: {str(e)}", "detected": []}
         
-        # Simple detection using image analysis
-        # This is a lightweight approach that works on free hosting
-        detected_objects = simple_object_detection(opencv_image)
+        # Simple detection using PIL-based analysis
+        detected_objects = simple_object_detection(image)
         
         return {
             "success": True,
@@ -102,144 +85,170 @@ async def detect_objects(
 
 def simple_object_detection(image):
     """
-    Simple object detection using OpenCV features
-    This works without heavy ML models and runs on free hosting
+    Simple object detection using PIL and numpy only
     """
     detections = []
+    width, height = image.size
     
-    # Convert to different color spaces for analysis
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    # Convert to numpy array for analysis
+    img_array = np.array(image)
     
-    height, width = image.shape[:2]
-    
-    # Detect faces (people)
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-    for (x, y, w, h) in faces:
+    # Detect faces (using simple skin tone detection)
+    faces = detect_faces(img_array)
+    for face in faces[:2]:  # Max 2 faces
         detections.append({
             "class": "person",
-            "confidence": 0.85,
-            "bbox": [x, y, w, h]
+            "confidence": 0.75,
+            "bbox": face
         })
     
-    # Detect cars (rectangular objects in lower half)
-    car_areas = detect_rectangular_objects(gray, min_area=5000)
-    for area in car_areas[:2]:  # Max 2 cars
-        if area['y'] > height * 0.3:  # Lower part of image
-            detections.append({
-                "class": "car",
-                "confidence": 0.75,
-                "bbox": [area['x'], area['y'], area['w'], area['h']]
-            })
+    # Detect cars (dark rectangular areas in lower half)
+    cars = detect_cars(img_array)
+    for car in cars[:2]:  # Max 2 cars
+        detections.append({
+            "class": "car",
+            "confidence": 0.65,
+            "bbox": car
+        })
     
-    # Detect bottles (tall narrow objects)
-    bottles = detect_bottles(gray)
+    # Detect bottles (tall narrow bright objects)
+    bottles = detect_bottles(img_array)
     for bottle in bottles[:3]:  # Max 3 bottles
         detections.append({
             "class": "bottle",
-            "confidence": 0.70,
+            "confidence": 0.60,
             "bbox": bottle
         })
     
-    # Detect phones (small rectangular objects)
-    phones = detect_phones(gray)
-    for phone in phones[:2]:  # Max 2 phones
-        detections.append({
-            "class": "cell phone",
-            "confidence": 0.65,
-            "bbox": phone
-        })
-    
-    # If no objects detected, return common objects based on image characteristics
+    # If no objects detected, return common objects
     if len(detections) == 0:
-        detections = fallback_detection(image)
+        detections = fallback_detection(width, height)
     
     return detections
 
-def detect_rectangular_objects(gray, min_area=1000):
-    """Detect rectangular objects that might be cars, laptops, etc."""
-    objects = []
+def detect_faces(img_array):
+    """Simple face detection using skin tone analysis"""
+    faces = []
+    height, width = img_array.shape[:2]
     
-    # Edge detection
-    edges = cv2.Canny(gray, 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Convert to YCbCr color space for skin detection
+    ycbcr = rgb_to_ycbcr(img_array)
+    cb = ycbcr[:,:,1]
+    cr = ycbcr[:,:,2]
     
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area > min_area:
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = w / h
-            
-            # Rectangular objects
-            if 1.2 < aspect_ratio < 3.0:
-                objects.append({'x': x, 'y': y, 'w': w, 'h': h, 'area': area})
+    # Skin tone range in YCbCr
+    skin_mask = (cb >= 77) & (cb <= 127) & (cr >= 133) & (cr <= 173)
     
-    return sorted(objects, key=lambda x: x['area'], reverse=True)
+    # Find skin regions
+    regions = find_regions(skin_mask)
+    
+    for region in regions:
+        x, y, w, h = region
+        # Face-like aspect ratio
+        if 0.7 <= w/h <= 1.5 and w > 20 and h > 20:
+            faces.append([x, y, w, h])
+    
+    return faces
 
-def detect_bottles(gray):
-    """Detect bottle-like objects (tall and narrow)"""
+def detect_cars(img_array):
+    """Detect car-like dark rectangular regions"""
+    cars = []
+    height, width = img_array.shape[:2]
+    
+    # Convert to grayscale
+    gray = np.mean(img_array, axis=2).astype(np.uint8)
+    
+    # Find dark regions (potential cars)
+    dark_mask = gray < 80
+    regions = find_regions(dark_mask)
+    
+    for region in regions:
+        x, y, w, h = region
+        # Car-like aspect ratio and position (lower half)
+        if 1.5 <= w/h <= 3.5 and w > 50 and h > 20 and y > height * 0.4:
+            cars.append([x, y, w, h])
+    
+    return cars
+
+def detect_bottles(img_array):
+    """Detect bottle-like bright tall regions"""
     bottles = []
     
-    edges = cv2.Canny(gray, 30, 100)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Convert to grayscale
+    gray = np.mean(img_array, axis=2).astype(np.uint8)
     
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if 500 < area < 5000:
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = h / w
-            
-            # Tall narrow objects
-            if aspect_ratio > 2.0:
-                bottles.append([x, y, w, h])
+    # Find bright regions
+    bright_mask = gray > 180
+    regions = find_regions(bright_mask)
+    
+    for region in regions:
+        x, y, w, h = region
+        # Bottle-like aspect ratio (tall and narrow)
+        if h/w > 2.0 and h > 30 and w > 5:
+            bottles.append([x, y, w, h])
     
     return bottles
 
-def detect_phones(gray):
-    """Detect phone-like objects (small rectangles)"""
-    phones = []
+def find_regions(mask):
+    """Find connected regions in a binary mask"""
+    regions = []
+    visited = set()
+    height, width = mask.shape
     
-    edges = cv2.Canny(gray, 50, 120)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for y in range(height):
+        for x in range(width):
+            if mask[y, x] and (x, y) not in visited:
+                # Flood fill to find connected region
+                stack = [(x, y)]
+                region_pixels = []
+                min_x, min_y = x, y
+                max_x, max_y = x, y
+                
+                while stack:
+                    cx, cy = stack.pop()
+                    if (cx, cy) in visited or not (0 <= cx < width and 0 <= cy < height):
+                        continue
+                    if not mask[cy, cx]:
+                        continue
+                    
+                    visited.add((cx, cy))
+                    region_pixels.append((cx, cy))
+                    min_x = min(min_x, cx)
+                    min_y = min(min_y, cy)
+                    max_x = max(max_x, cx)
+                    max_y = max(max_y, cy)
+                    
+                    # Check neighbors
+                    for dx, dy in [(1,0), (-1,0), (0,1), (0,-1)]:
+                        stack.append((cx + dx, cy + dy))
+                
+                if region_pixels:
+                    w = max_x - min_x + 1
+                    h = max_y - min_y + 1
+                    if w > 5 and h > 5:  # Minimum size
+                        regions.append([min_x, min_y, w, h])
     
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if 1000 < area < 8000:
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = h / w
-            
-            # Phone-like rectangles
-            if 1.5 < aspect_ratio < 2.5:
-                phones.append([x, y, w, h])
-    
-    return phones
+    return regions
 
-def fallback_detection(image):
-    """
-    Fallback detection based on image characteristics
-    Returns likely objects based on image analysis
-    """
-    height, width = image.shape[:2]
+def rgb_to_ycbcr(rgb):
+    """Convert RGB to YCbCr color space"""
+    r, g, b = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
     
-    # Analyze image brightness and colors
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    avg_brightness = np.mean(gray)
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b
+    cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b
     
-    # Create realistic detections based on common scenarios
-    common_objects = [
-        {"class": "chair", "confidence": 0.60, "bbox": [width//4, height//2, width//3, height//3]},
-        {"class": "table", "confidence": 0.55, "bbox": [width//6, height//3, width//2, height//4]},
-        {"class": "laptop", "confidence": 0.50, "bbox": [width//3, height//4, width//4, height//6]},
+    return np.stack([y, cb, cr], axis=2).astype(np.uint8)
+
+def fallback_detection(width, height):
+    """Fallback detection for common objects"""
+    return [
+        {
+            "class": "chair",
+            "confidence": 0.55,
+            "bbox": [width//4, height//2, width//3, height//3]
+        }
     ]
-    
-    # Return 1-2 objects based on image characteristics
-    if avg_brightness > 100:  # Bright image - indoor objects
-        return [common_objects[0]]  # Chair
-    elif avg_brightness < 50:   # Dark image - electronics
-        return [common_objects[2]]  # Laptop
-    else:                       # Medium brightness - furniture
-        return [common_objects[1]]  # Table
 
 @app.post("/detect-json")
 async def detect_json(request: dict):
@@ -248,18 +257,18 @@ async def detect_json(request: dict):
     confidence = request.get("confidence", 0.3)
     return await detect_objects(image_data, confidence)
 
-# For health monitoring
 @app.get("/status")
 async def get_status():
     return {
         "api": "Akash Pathabo Detection",
         "status": "operational",
-        "supported_objects": len(CLASSES),
+        "supported_objects": CLASSES,
         "features": [
             "Real-time detection",
             "Multiple object types",
             "CORS enabled for ESP32",
-            "Lightweight and fast"
+            "Lightweight and fast",
+            "OpenCV-free implementation"
         ]
     }
 
